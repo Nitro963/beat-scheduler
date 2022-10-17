@@ -1,0 +1,25 @@
+FROM python:3.8.12 AS prepare
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y gettext
+
+WORKDIR /server_code
+COPY requirements.txt /server_code/
+RUN python -m pip install --upgrade pip
+RUN pip3 install -I --no-cache-dir -r requirements.txt
+RUN pip3 install uWSGI gunicorn
+
+FROM prepare AS build
+
+COPY ./docker/django-entrypoint.sh /docker-entrypoint.sh
+RUN chmod 744 /docker-entrypoint.sh
+
+# Add a user and update permissions
+RUN groupadd django
+RUN useradd -g django django-master
+RUN chown django-master:django /docker-entrypoint.sh
+USER django-master
+
+COPY . /server_code
+ENTRYPOINT /docker-entrypoint.sh

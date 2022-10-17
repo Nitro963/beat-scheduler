@@ -1,0 +1,243 @@
+version: "3.9"
+
+networks:
+  compose-network:
+    driver: bridge
+
+volumes:
+  mysql_bin_volume:
+    name: ${DOCKER_PROJECT}_mysql_bin_volume
+
+services:
+  db:
+    container_name: ${DOCKER_PROJECT}-mysql
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./docker/sql/01-test-db.sql:/docker-entrypoint-initdb.d/01-test-db.sql
+      - ./docker/sql/02-privileges.sql:/docker-entrypoint-initdb.d/02-privileges.sql
+      - mysql_bin_volume:/usr/bin
+    networks:
+      - compose-network
+    command: [ 'mysqld', '--character-set-server=utf8mb4', '--collation-server=utf8mb4_unicode_ci' ]
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  redis:
+    container_name: ${DOCKER_PROJECT}-redis
+    image: redis:alpine
+    command: redis-server /etc/redis/redis.conf
+    restart: unless-stopped
+    volumes:
+      - ./docker/etc/redis/redis.conf:/etc/redis/redis.conf
+    networks:
+      - compose-network
+    healthcheck:
+      test: ["CMD-SHELL", "[ $$(redis-cli --pass $REDIS_PASSWORD ping) = PONG ]"]
+      retries: 3
+      timeout: 5s
+
+  rabbitmq:
+    container_name: ${DOCKER_PROJECT}-rabbitmq
+    image: rabbitmq:management-alpine
+    ports:
+      - "7071:15672"
+    networks:
+      - compose-network
+    restart: unless-stopped
+    volumes:
+      - ./docker/etc/rabbitmq:/etc/rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      retries: 3
+      timeout: 5s
+
+  redisinsight:
+    container_name: ${DOCKER_PROJECT}-redisinsight
+    image: "redislabs/redisinsight"
+    restart: unless-stopped
+    networks:
+      - compose-network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  nginx:
+      build:
+        context: .
+        dockerfile: ./docker/Dockerfile-nginx
+      container_name: ${DOCKER_PROJECT}-nginx
+      restart: unless-stopped
+      environment:
+        NGINX_USER: ${NGINX_USER}
+        NGINX_PASSWORD: ${NGINX_PASSWORD}
+      networks:
+        - compose-network
+      ports:
+        - "7072:80"
+      volumes:
+        - ./docker/etc/nginx/nginx.conf:/etc/nginx/nginx.conf
+      depends_on:
+        redisinsight:
+          condition: service_started
+
+  phpmyadmin:
+    container_name: ${DOCKER_PROJECT}-myadmin
+    image: phpmyadmin:5.1.0-apache
+    restart: unless-stopped
+    environment:
+      PMA_HOST: ${DOCKER_PROJECT}-mysql
+    ports:
+      - '7073:80'
+    networks:
+      - compose-network
+    depends_on:
+      db:
+        condition: service_healthy
+
+  flower:
+    container_name: ${DOCKER_PROJECT}-flower
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/Dockerfile-flower
+    ports:
+      - "7074:5555"
+    environment:
+      FLOWER_BASIC_AUTH: ${FLOWER_USER}:${FLOWER_PASSWORD}
+      FLOWER_BROKER_API: http://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:15672/api/
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/${RABBITMQ_VHOST}
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/${REDIS_DB_NUMBER}
+    networks:
+      - compose-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    container_name: ${DOCKER_PROJECT}-web
+    restart: always
+    build:
+        context: .
+        dockerfile: /docker/Dockerfile-django
+    volumes:
+      - .:/server_code
+      - mysql_bin_volume:/usr/bin
+    environment:
+      SECRET_KEY: ${SECRET_KEY}
+      DEBUG: ${DEBUG}
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB_NUMBER: ${REDIS_DB_NUMBER}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST}
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      REDIS_PORT: 6379
+    ports:
+      - "0.0.0.0:7075:8000"
+    networks:
+      - compose-network
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    container_name: ${DOCKER_PROJECT}-celery-worker
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/Dockerfile-celery-worker
+    volumes:
+      - .:/server_code
+    environment:
+      CELERY_APP: beat_scheduler
+      SECRET_KEY: ${SECRET_KEY}
+      DEBUG: ${DEBUG}
+      LOG_LEVEL: WARNING
+      WORKER_NAME: worker0
+      WORKERS_QUEUES: "celery_default,celery_hello"
+      WORKER_ACKS_LATE: 0
+      POOL: threads
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB_NUMBER: ${REDIS_DB_NUMBER}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST}
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      REDIS_PORT: 6379
+    networks:
+      - compose-network
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'celery', 'inspect', 'ping']
+      retries: 5
+      timeout: 10s
+
+  beat:
+    container_name: ${DOCKER_PROJECT}-celery-beat
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/Dockerfile-celery-worker
+    entrypoint: /beat-entrypoint.sh
+    volumes:
+      - .:/server_code
+    environment:
+      CELERY_APP: beat_scheduler
+      SECRET_KEY: ${SECRET_KEY}
+      DEBUG: ${DEBUG}
+      LOG_LEVEL: WARNING
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB_NUMBER: ${REDIS_DB_NUMBER}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST}
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      REDIS_PORT: 6379
+    networks:
+      - compose-network
+    depends_on:
+      db:
+        condition: service_healthy
+      worker:
+        condition: service_healthy

@@ -1,0 +1,37 @@
+FROM python:3.8.12 AS prepare
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /server_code
+COPY requirements.txt /server_code/
+RUN python -m pip install --upgrade pip
+RUN pip3 install -I --no-cache-dir -r requirements.txt
+
+RUN pip install celery
+RUN pip install -r requirements.txt
+
+
+FROM prepare AS build
+
+ENV CELERY_APP=app.celery
+ENV LOG_LEVEL=INFO
+ENV POOL=threads
+ENV WORKER_NAME=worker
+ENV WORKERS_QUEUES="celery,default"
+
+COPY ./docker/pytest-entrypoint.sh /pytest-entrypoint.sh
+COPY ./docker/beat-entrypoint.sh /beat-entrypoint.sh
+COPY ./docker/worker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod 744 /pytest-entrypoint.sh && chmod 744 /beat-entrypoint.sh && chmod 744 /docker-entrypoint.sh
+
+# Add a user and update permissions
+RUN groupadd celery; \
+    useradd -g celery celery-master
+RUN chown celery-master:celery /pytest-entrypoint.sh && \
+    chown celery-master:celery /beat-entrypoint.sh && \
+    chown celery-master:celery /docker-entrypoint.sh
+USER celery-master
+
+COPY . /server_code
+
+ENTRYPOINT /docker-entrypoint.sh
